@@ -1,0 +1,277 @@
+import { useDropZoneWithStore } from "../integration/use-drop-zone-with-store";
+import { useImageStore, generateImageId } from "@/store/image-store";
+import { useBrowserImageDrop } from "../integration/use-browser-image-drop";
+import { useAppStore } from "@/store/app-store";
+import { toast } from "sonner";
+
+interface UseCanvasDropOptions {
+  canvasId?: string;
+}
+
+/**
+ * Feature hook for canvas drop zone.
+ * Handles:
+ * - Element gallery → canvas (positioning)
+ * - Browser → canvas (add as element)
+ * - Desktop file → canvas (add as element)
+ */
+export function useCanvasDrop({
+  canvasId = "canvas",
+}: UseCanvasDropOptions = {}) {
+  //
+  const addPositionedInstance = useImageStore(
+    (state) => state.addPositionedInstance
+  );
+  const addElement = useImageStore((state) => state.addElement);
+  const setSourceImageFromGenerated = useImageStore(
+    (state) => state.setSourceImageFromGenerated
+  );
+  const generatedImages = useImageStore((state) => state.generatedImages);
+
+  // Handle browser image drops
+  const {
+    isDragAvailable: isBrowserDragAvailable,
+    dragData,
+    requestImageData,
+  } = useBrowserImageDrop();
+
+  const { isDragging, canAcceptDrop, dragSource, dropProps } =
+    useDropZoneWithStore({
+      target: "canvas",
+      accept: ["image/*"],
+      onDrop: async (result, event) => {
+        console.log("[useCanvasDrop] Processing drop", result);
+
+        /*
+          FROM ELEMENT GALLERY
+        */
+        if (result.source === "element-gallery") {
+          // Position existing element on canvas
+          // Note: dataTransfer converts all keys to lowercase, so elementId becomes elementid
+          const elementId =
+            result.metadata?.elementid || result.metadata?.elementId;
+          if (!elementId) {
+            throw new Error("Missing elementId in drop metadata");
+          }
+
+          const position = positionElementOnCanvas(
+            elementId,
+            event,
+            canvasId,
+            addPositionedInstance
+          );
+
+          console.log("[useCanvasDrop] Positioned element from gallery", {
+            elementId,
+            position,
+          });
+        }
+
+        //
+        /*
+          FROM GENERATED GALLERY
+        */
+        else if (result.source === "generated-gallery") {
+          // Set generated image as new source image
+          const generatedImageId =
+            result.metadata?.generatedImageId ||
+            result.metadata?.generatedimageid;
+          if (!generatedImageId) {
+            throw new Error("Missing generatedImageId from generated gallery");
+          }
+
+          console.log("[useCanvasDrop] Finding generated image", {
+            generatedImageId,
+          });
+
+          // Find the generated image in the store
+          const generatedImage = generatedImages.find(
+            (img) => img.id === generatedImageId
+          );
+
+          if (!generatedImage) {
+            throw new Error(
+              `Generated image not found in store: ${generatedImageId}`
+            );
+          }
+
+          console.log("[useCanvasDrop] Setting generated image as source", {
+            generatedImageId,
+          });
+
+          // Set as new source image (this will clear positioned instances and current generated image)
+          setSourceImageFromGenerated(generatedImage);
+
+          console.log(
+            "[useCanvasDrop] Generated image set as source successfully"
+          );
+        }
+
+        //
+        /*
+          FROM BROWSER
+        */
+        else if (result.source === "browser") {
+          // Add browser image as new element
+          // Get imageUrl from dragData (set by useBrowserImageDrop)
+          const imageUrl = dragData?.imageUrl || result.imageUrl;
+          if (!imageUrl) {
+            throw new Error("Missing imageUrl from browser drag");
+          }
+
+          console.log("[useCanvasDrop] Browser drop - fetching image data", {
+            imageUrl,
+          });
+
+          // Request full image data from background
+          const dataUrl = await requestImageData(imageUrl);
+          if (!dataUrl) {
+            throw new Error("Failed to fetch browser image");
+          }
+
+          console.log(
+            "[useCanvasDrop] Browser drop - image data fetched successfully"
+          );
+
+          // Check if this image already exists in the element store
+          const existingElement = useImageStore
+            .getState()
+            .elements.find((el) => el.dataUrl === dataUrl);
+
+          let elementToPosition;
+
+          if (existingElement) {
+            console.log(
+              "[useCanvasDrop] Browser image already exists in elements, reusing",
+              { elementId: existingElement.id }
+            );
+            elementToPosition = existingElement;
+          } else {
+            // Get dimensions
+            const dimensions = await getImageDimensions(dataUrl);
+
+            // Create a File object (ID will be generated by addElement)
+            const file = await dataUrlToFile(dataUrl, `browser-image.png`);
+
+            console.log("[useCanvasDrop] Adding new browser image as element");
+
+            // Get elements count before adding to find the new one
+            const elementsCountBefore =
+              useImageStore.getState().elements.length;
+
+            addElement(file, dataUrl, dimensions);
+
+            // Get the newly added element (it's the last one)
+            const newElement =
+              useImageStore.getState().elements[elementsCountBefore];
+
+            if (!newElement) {
+              throw new Error("Failed to add element to store");
+            }
+
+            elementToPosition = newElement;
+          }
+
+          // Position the element on canvas (either existing or newly added)
+          const position = positionElementOnCanvas(
+            elementToPosition.id,
+            event,
+            canvasId,
+            addPositionedInstance
+          );
+
+          console.log("[useCanvasDrop] Positioned browser image on canvas", {
+            imageId: elementToPosition.id,
+            position,
+            wasExisting: !!existingElement,
+          });
+        }
+        //
+        /*
+          FROM DESKTOP
+        */
+        else if (result.source === "desktop" && result.file) {
+          // Add desktop file as new element
+          const dataUrl = await fileToDataUrl(result.file);
+          const dimensions = await getImageDimensions(dataUrl);
+
+          console.log("[useCanvasDrop] Adding desktop file as element");
+          addElement(result.file, dataUrl, dimensions);
+        }
+      },
+      onError: (error) => {
+        console.error("[useCanvasDrop] Drop failed:", error);
+      },
+    });
+
+  return {
+    isDragging: isDragging || isBrowserDragAvailable,
+    canAcceptDrop,
+    dragSource,
+    isBrowserDragAvailable,
+    acceptedSources: [
+      "element-gallery",
+      "generated-gallery",
+      "browser",
+      "desktop",
+    ] as const,
+    dropProps,
+  };
+}
+
+// Helper utilities
+
+/**
+ * Calculate drop position and create positioned instance in store.
+ * Returns the calculated position for logging/debugging.
+ */
+function positionElementOnCanvas(
+  elementId: string,
+  event: React.DragEvent,
+  canvasId: string,
+  addPositionedInstance: (id: string, x: number, y: number) => void
+): { x: number; y: number } {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) {
+    throw new Error("Canvas element not found");
+  }
+
+  const rect = canvas.getBoundingClientRect();
+  // Convert to relative coordinates (0-1) using actual drop position
+  const x = (event.clientX - rect.left) / rect.width;
+  const y = (event.clientY - rect.top) / rect.height;
+
+  // Clamp to canvas bounds
+  const clampedX = Math.max(0, Math.min(1, x));
+  const clampedY = Math.max(0, Math.min(1, y));
+
+  addPositionedInstance(elementId, clampedX, clampedY);
+
+  return { x: clampedX, y: clampedY };
+}
+
+function getImageDimensions(
+  dataUrl: string
+): Promise<{ width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve({ width: img.width, height: img.height });
+    img.onerror = reject;
+    img.src = dataUrl;
+  });
+}
+
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+async function dataUrlToFile(dataUrl: string, filename: string): Promise<File> {
+  const response = await fetch(dataUrl);
+  const blob = await response.blob();
+  return new File([blob], filename, { type: blob.type });
+}
